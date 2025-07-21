@@ -1,0 +1,546 @@
+import streamlit as st
+import pdfplumber
+import re
+import pandas as pd
+from io import BytesIO
+from fuzzywuzzy import fuzz
+
+def truncate_after_sri_lanka(addr: str) -> str:
+    part, sep, _ = addr.partition("Sri Lanka")
+    return (part + sep).strip() if sep else addr.strip()
+
+def extract_wo_fields(pdf_file):
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    customer = delivery = ""
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if "Deliver To:" in ln:
+            customer = lines[i-1].strip() if i > 0 else ""
+            delivery = re.sub(r"Deliver To:\s*", "", ln).strip()
+            break
+    codes = re.findall(r"Product Code[:\s]*([A-Z]+\s*\d+(?:\s*/\s*[A-Z]+\s*\d+)*)", text)
+    all_codes = []
+    for item in codes:
+        parts = [c.strip() for c in item.split("/")]
+        all_codes += parts
+    return {"customer_name": customer, "delivery_address": delivery, "product_codes": list(set(all_codes))}
+
+def extract_po_fields(pdf_file):
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    lines = [ln.strip() for ln in text.split("\n")]
+    capture = False
+    address_lines = []
+    for ln in lines:
+        if "Delivery Location:" in ln:
+            capture = True
+            continue
+        if capture:
+            if "Forwarder:" in ln:
+                break
+            if ln:
+                address_lines.append(ln)
+    raw_addr = " ".join(address_lines)
+    matches = re.findall(r".*Sri Lanka.*", text, re.IGNORECASE)
+    unique = [raw_addr] + [m for m in matches if m != raw_addr]
+    seen = []
+    for a in unique:
+        if a and a not in seen:
+            seen.append(a)
+    sri = [a for a in seen if "sri lanka" in a.lower()]
+    chosen = max(sri, key=len) if sri else seen[0] if seen else raw_addr
+    final_addr = truncate_after_sri_lanka(chosen)
+    po_codes = re.findall(r"(LB\s*\d+)", text)
+    return {"delivery_location": final_addr, "product_codes": po_codes, "all_found_addresses": seen}
+
+def extract_po_details(pdf_file):
+    """
+    Extract PO details including color codes and sizes from "Colour/Size/Destination:" line.
+    Returns a list of item dicts.
+    """
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    po_items = []
+    for i, line in enumerate(lines):
+        item_match = re.search(r'^(\d+)\s+([A-Z0-9]+)\s+(\d+)\s+(\d+\.\d+)\s+PCS', line)
+        if item_match:
+            item_number = item_match.group(1)
+            item_code = item_match.group(2)
+            quantity = float(item_match.group(4))
+            colour_code = ""
+            size = ""
+            for j in range(i + 1, min(i + 15, len(lines))):
+                if "Colour/Size/Destination:" in lines[j]:
+                    colour_size_line = lines[j].replace("Colour/Size/Destination:", "").strip()
+                    color_match = re.search(r'^(\S+)', colour_size_line)
+                    if color_match:
+                        colour_code = color_match.group(1)
+                    size_match = re.search(r'/\s*([^/]+)\s*/', colour_size_line)
+                    if size_match:
+                        size = size_match.group(1).strip()
+                    break
+                if re.search(r'\b([A-Z0-9]{4})\b', lines[j]):
+                    color_code_match = re.search(r'\b([A-Z0-9]{4})\b', lines[j])
+                    if color_code_match and not colour_code:
+                        colour_code = color_code_match.group(1)
+            price_match = re.search(r'(\d+\.\d+)$', line)
+            price = price_match.group(1) if price_match else ""
+            po_items.append({
+                "Item_Number": item_number,
+                "Item_Code": item_code,
+                "Quantity": int(quantity),
+                "Colour_Code": colour_code,
+                "Size": size,
+                "Price": price
+            })
+    return po_items
+
+def extract_color_codes_from_table(text):
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    color_codes = []
+    colour_header_line_idx = -1
+    colour_column_position = -1
+    for i, line in enumerate(lines):
+        if "Colour" in line and "Code" in line:
+            colour_header_line_idx = i
+            colour_match = re.search(r'Colour\s*Code', line, re.IGNORECASE)
+            if colour_match:
+                colour_column_position = colour_match.start()
+                break
+    if colour_header_line_idx == -1:
+        return []
+    header_line = lines[colour_header_line_idx]
+    for i in range(colour_header_line_idx + 1, len(lines)):
+        line = lines[i]
+        if any(marker in line.lower() for marker in [
+            "number of size changes", "end of works order", "page", "version", "http://", "generated"
+        ]):
+            break
+        if not line or len(line.split()) < 2:
+            continue
+        if colour_column_position != -1:
+            try:
+                parts = line.split()
+                if len(parts) >= 3:
+                    for part in parts:
+                        if re.match(r'^[A-Z0-9]+$', part) and len(part) >= 2 and len(part) <= 10:
+                            if not part.isdigit() and part not in ['XS', 'XP', 'S', 'M', 'L', 'XL', 'XXL', 'XG', 'XXG']:
+                                color_codes.append(part)
+                                break
+            except:
+                pass
+        color_patterns = [
+            r'\b([A-Z]{1,2}[A-Z0-9]{1,8})\b',
+            r'\b([A-Z]{2,4})\b',
+            r'\b([A-Z0-9\-]{2,8})\b'
+        ]
+        for pattern in color_patterns:
+            matches = re.findall(pattern, line)
+            for match in matches:
+                if match not in ['SIZE', 'STYLE', 'PRICE', 'MULTI', 'RETAIL', 'DESC', 'ARTICLE', 'QUANTITY', 'US', 'CA'] and match not in color_codes:
+                    color_codes.append(match)
+    if not color_codes:
+        fallback_patterns = [
+            r'\b([A-Z]{4})\b',
+            r'\b([A-Z]{2,3})\b'
+        ]
+        for pattern in fallback_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                if (match not in ['SIZE', 'CODE', 'STYLE', 'PRICE', 'MULTI', 'RETAIL', 'DESC', 'ARTICLE', 'QUANTITY', 'DATE', 'DELIVERY', 'ORDER', 'WORKS', 'COPY', 'DETAILS', 'CARE', 'SEASON', 'PRINT', 'COLOR', 'COMBO', 'COLLECTION', 'ENTRY', 'HEADER', 'CONFIRMED', 'CUSTOMER', 'PRINTED', 'RECEIVED', 'FACTORY', 'CONTACT', 'COMMENTS', 'SPECIAL', 'REQUIREMENTS', 'INSTRUCTIONS', 'PRODUCT', 'BRANCH', 'NUMBER', 'ITEM', 'TYPE', 'PAPER', 'DESCRIPTION', 'TICKET', 'UNITS', 'IMAGE', 'LENGTH', 'WIDTH', 'FACTORY', 'BREAKDOWN', 'PANTY', 'CHANGES']
+                    and len(match) >= 2
+                    and match not in color_codes):
+                    color_codes.append(match)
+    unique_codes = []
+    for code in color_codes:
+        if code not in unique_codes:
+            unique_codes.append(code)
+    return unique_codes
+
+def extract_wo_items(pdf_file):
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    items = []
+    color_codes = extract_color_codes_from_table(text)
+    table_pattern = (
+        r"(\d{8,})\s+"              # Style number (8+ digits)
+        r"([A-Z0-9]+)\s+"           # Color code (like 7EPG)
+        r"([A-Z]+/[A-Z]+)\s+"       # Size (like XS/XP, S/P, M/M)
+        r"\$[\d.]+\s+\$[\d.]+\s+"   # Prices
+        r"(\d{13})\s+"              # SKU/UPC
+        r"(\d+)\s+"                 # Article number
+        r"(\d+)"                    # Quantity
+    )
+    table_matches = re.findall(table_pattern, text)
+    if table_matches:
+        for match in table_matches:
+            style, color_code, size, sku, article, quantity = match
+            items.append({
+                "Style": style,
+                "Size 1": size,
+                "Quantity": int(quantity),
+                "Colour Code": color_code,
+                "SKU": sku,
+                "Article": article
+            })
+    else:
+        original_pattern = (
+            r"(\d{8,})\s+"              # Style
+            r"\S+\s+"                   # Article/Desc
+            r"([A-Z]+\/[A-Z]+)\s+"      # Size 1
+            r"\$\d+\.\d+\s+\$\d+\.\d+\s+"  # Prices
+            r"\d{13}\s+\d+\s+"          # Extra ID
+            r"(\d+)"                    # Quantity
+        )
+        matches = re.findall(original_pattern, text)
+        for i, match in enumerate(matches):
+            style, size, qty = match
+            color = color_codes[i % len(color_codes)] if color_codes else ""
+            items.append({
+                "Style": style,
+                "Size 1": size,
+                "Quantity": int(qty),
+                "Colour Code": color
+            })
+    return items
+
+def extract_po_quantities(pdf_file):
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    pattern = r"(\d{1,4}\.\d{3})\s+PCS"
+    quantities = re.findall(pattern, text)
+    po_qtys = [int(float(qty)) for qty in quantities]
+    return po_qtys
+
+def compare_addresses(wo, po):
+    ns = fuzz.token_sort_ratio(wo["customer_name"], po["delivery_location"])
+    as_ = fuzz.token_sort_ratio(wo["delivery_address"], po["delivery_location"])
+    comb = max(ns, as_)
+    return {"WO Name": wo["customer_name"], "WO Addr": wo["delivery_address"], "PO Addr": po["delivery_location"],
+            "Name %": ns, "Addr %": as_, "Overall %": comb, "Status": "✅ Match" if comb > 85 else "⚠️ Review"}
+
+def compare_codes(wo_codes, po_codes):
+    results = []
+    for wc in wo_codes:
+        found_match = False
+        for pc in po_codes:
+            pts = fuzz.ratio(wc, pc)
+            results.append({"WO Code": wc, "PO Code": pc, "Match %": pts,
+                            "Status": "✅ Match" if pts == 100 else "⚠️ Partial" if pts > 80 else "❌ No"})
+            if pts == 100:
+                found_match = True
+        if not found_match:
+            results.append({"WO Code": wc, "PO Code": "", "Match %": "", "Status": "❌ WO code not found in PO"})
+    return results
+
+def enhanced_quantity_matching(wo_items, po_details, tolerance=0):
+    """
+    Enhanced quantity matching that includes color codes and sizes from PO details.
+    Matches WO items with PO items based on quantity and adds color/size info.
+    """
+    matched = []
+    mismatched = []
+    used_po_indices = set()
+    for wo_item in wo_items:
+        wo_qty = wo_item["Quantity"]
+        found_match = False
+        for po_index, po_item in enumerate(po_details):
+            if po_index not in used_po_indices:
+                po_qty = po_item["Quantity"]
+                diff = abs(po_qty - wo_qty)
+                if diff <= tolerance:
+                    used_po_indices.add(po_index)
+                    status = "✅ Match" if diff == 0 else "✅ Near Match"
+                    matched.append({
+                        "WO Style": wo_item.get("Style", ""),
+                        "WO Size": wo_item.get("Size 1", ""),
+                        "WO Colour Code": wo_item.get("Colour Code", ""),
+                        "WO Qty": wo_qty,
+                        "PO Qty": po_qty,
+                        "Diff": po_qty - wo_qty,
+                        "Status": status,
+                        "PO Colour Code": po_item.get("Colour_Code", ""),
+                        "PO Size": po_item.get("Size", ""),
+                        "PO Item Code": po_item.get("Item_Code", "")
+                    })
+                    found_match = True
+                    break
+        if not found_match:
+            closest_po_item = None
+            closest_diff = float('inf')
+            closest_po_index = None
+            for po_index, po_item in enumerate(po_details):
+                if po_index not in used_po_indices:
+                    po_qty = po_item["Quantity"]
+                    diff = abs(po_qty - wo_qty)
+                    if diff < closest_diff:
+                        closest_diff = diff
+                        closest_po_item = po_item
+                        closest_po_index = po_index
+            if closest_po_item is not None:
+                used_po_indices.add(closest_po_index)
+                mismatched.append({
+                    "WO Style": wo_item.get("Style", ""),
+                    "WO Size": wo_item.get("Size 1", ""),
+                    "WO Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": closest_po_item["Quantity"],
+                    "Diff": closest_po_item["Quantity"] - wo_qty,
+                    "Status": "⚠️ Mismatch",
+                    "PO Colour Code": closest_po_item.get("Colour_Code", ""),
+                    "PO Size": closest_po_item.get("Size", ""),
+                    "PO Item Code": closest_po_item.get("Item_Code", "")
+                })
+            else:
+                mismatched.append({
+                    "WO Style": wo_item.get("Style", ""),
+                    "WO Size": wo_item.get("Size 1", ""),
+                    "WO Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": None,
+                    "Diff": "",
+                    "Status": "❌ No PO Qty",
+                    "PO Colour Code": "",
+                    "PO Size": "",
+                    "PO Item Code": "",
+                })
+    for po_index, po_item in enumerate(po_details):
+        if po_index not in used_po_indices:
+            mismatched.append({
+                "WO Style": "N/A",
+                "WO Size": "N/A",
+                "WO Colour Code": "N/A",
+                "WO Qty": None,
+                "PO Qty": po_item["Quantity"],
+                "Diff": "",
+                "Status": "❌ Extra PO Item",
+                "PO Colour Code": po_item.get("Colour_Code", ""),
+                "PO Size": po_item.get("Size", ""),
+                "PO Item Code": po_item.get("Item_Code", "")
+            })
+    return matched, mismatched
+
+def smart_quantity_matching(wo_items, po_qtys):
+    matched = []
+    mismatched = []
+    used_po_indices = set()
+    for wo_item in wo_items:
+        wo_qty = wo_item["Quantity"]
+        found_match = False
+        for po_index, po_qty in enumerate(po_qtys):
+            if po_index not in used_po_indices and po_qty == wo_qty:
+                used_po_indices.add(po_index)
+                matched.append({
+                    "Style": wo_item["Style"],
+                    "Size 1": wo_item["Size 1"],
+                    "Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": po_qty,
+                    "Diff": 0,
+                    "Status": "✅ Match",
+                    "PO Index": po_index
+                })
+                found_match = True
+                break
+        if not found_match:
+            closest_po_qty = None
+            closest_diff = float('inf')
+            closest_po_index = None
+            for po_index, po_qty in enumerate(po_qtys):
+                if po_index not in used_po_indices:
+                    diff = abs(po_qty - wo_qty)
+                    if diff < closest_diff:
+                        closest_diff = diff
+                        closest_po_qty = po_qty
+                        closest_po_index = po_index
+            if closest_po_qty is not None:
+                used_po_indices.add(closest_po_index)
+                mismatched.append({
+                    "Style": wo_item["Style"],
+                    "Size 1": wo_item["Size 1"],
+                    "Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": closest_po_qty,
+                    "Diff": closest_po_qty - wo_qty,
+                    "Status": "⚠️ Mismatch",
+                    "PO Index": closest_po_index
+                })
+            else:
+                mismatched.append({
+                    "Style": wo_item["Style"],
+                    "Size 1": wo_item["Size 1"],
+                    "Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": None,
+                    "Diff": "",
+                    "Status": "❌ No PO Qty",
+                    "PO Index": None
+                })
+    unused_po_qtys = []
+    for po_index, po_qty in enumerate(po_qtys):
+        if po_index not in used_po_indices:
+            unused_po_qtys.append({
+                "Style": "N/A",
+                "Size 1": "N/A",
+                "Colour Code": "N/A",
+                "WO Qty": None,
+                "PO Qty": po_qty,
+                "Diff": "",
+                "Status": "❌ Extra PO Qty",
+                "PO Index": po_index
+            })
+    mismatched.extend(unused_po_qtys)
+    return matched, mismatched
+
+def smart_quantity_matching_with_tolerance(wo_items, po_qtys, tolerance=0):
+    matched = []
+    mismatched = []
+    used_po_indices = set()
+    for wo_item in wo_items:
+        wo_qty = wo_item["Quantity"]
+        found_match = False
+        for po_index, po_qty in enumerate(po_qtys):
+            if po_index not in used_po_indices:
+                diff = abs(po_qty - wo_qty)
+                if diff <= tolerance:
+                    used_po_indices.add(po_index)
+                    status = "✅ Match" if diff == 0 else "✅ Near Match"
+                    matched.append({
+                        "Style": wo_item["Style"],
+                        "Size 1": wo_item["Size 1"],
+                        "Colour Code": wo_item.get("Colour Code", ""),
+                        "WO Qty": wo_qty,
+                        "PO Qty": po_qty,
+                        "Diff": po_qty - wo_qty,
+                        "Status": status,
+                        "PO Index": po_index
+                    })
+                    found_match = True
+                    break
+        if not found_match:
+            closest_po_qty = None
+            closest_diff = float('inf')
+            closest_po_index = None
+            for po_index, po_qty in enumerate(po_qtys):
+                if po_index not in used_po_indices:
+                    diff = abs(po_qty - wo_qty)
+                    if diff < closest_diff:
+                        closest_diff = diff
+                        closest_po_qty = po_qty
+                        closest_po_index = po_index
+            if closest_po_qty is not None:
+                used_po_indices.add(closest_po_index)
+                mismatched.append({
+                    "Style": wo_item["Style"],
+                    "Size 1": wo_item["Size 1"],
+                    "Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": closest_po_qty,
+                    "Diff": closest_po_qty - wo_qty,
+                    "Status": "⚠️ Mismatch",
+                    "PO Index": closest_po_index
+                })
+            else:
+                mismatched.append({
+                    "Style": wo_item["Style"],
+                    "Size 1": wo_item["Size 1"],
+                    "Colour Code": wo_item.get("Colour Code", ""),
+                    "WO Qty": wo_qty,
+                    "PO Qty": None,
+                    "Diff": "",
+                    "Status": "❌ No PO Qty",
+                    "PO Index": None
+                })
+    unused_po_qtys = []
+    for po_index, po_qty in enumerate(po_qtys):
+        if po_index not in used_po_indices:
+            unused_po_qtys.append({
+                "Style": "N/A",
+                "Size 1": "N/A",
+                "Colour Code": "N/A",
+                "WO Qty": None,
+                "PO Qty": po_qty,
+                "Diff": "",
+                "Status": "❌ Extra PO Qty",
+                "PO Index": po_index
+            })
+    mismatched.extend(unused_po_qtys)
+    return matched, mismatched
+
+def compare_quantity_by_order(wo_items, po_qtys):
+    return smart_quantity_matching(wo_items, po_qtys)
+
+def make_excel(addr_res, code_res, wo_items, matched, mismatched, po_details=None):
+    df_addr = pd.DataFrame([addr_res])
+    df_codes = pd.DataFrame(code_res)
+    df_items = pd.DataFrame(wo_items)
+    df_match = pd.DataFrame(matched)
+    df_mismatch = pd.DataFrame(mismatched)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        df_addr.to_excel(writer, sheet_name="Address Comparison", index=False)
+        df_codes.to_excel(writer, sheet_name="Code Comparison", index=False)
+        df_items.to_excel(writer, sheet_name="WO Items", index=False)
+        df_match.to_excel(writer, sheet_name="Matched Quantities", index=False)
+        df_mismatch.to_excel(writer, sheet_name="Mismatched Quantities", index=False)
+        if po_details:
+            df_po_details = pd.DataFrame(po_details)
+            df_po_details.to_excel(writer, sheet_name="PO Details", index=False)
+    buf.seek(0)
+    return buf
+
+
+# --------- Streamlit UI ---------
+st.set_page_config(page_title="WO ↔ PO Compare", layout="centered")
+st.title("📄 WO vs PO Comparator")
+
+matching_method = st.selectbox(
+    "Choose Quantity Matching Method:",
+    ["Enhanced Matching (with PO Color/Size)", "Smart Matching (Exact)", "Smart Matching with Tolerance", "Original Order-based"]
+)
+
+if matching_method == "Smart Matching with Tolerance":
+    tolerance = st.number_input("Tolerance (acceptable difference)", min_value=0, max_value=100, value=5)
+elif matching_method == "Enhanced Matching (with PO Color/Size)":
+    tolerance = st.number_input("Tolerance (acceptable difference)", min_value=0, max_value=100, value=0)
+
+wo_file = st.file_uploader("Upload WO PDF", type="pdf")
+po_file = st.file_uploader("Upload PO PDF", type="pdf")
+
+if wo_file and po_file:
+    st.success("Processing...")
+    wo = extract_wo_fields(wo_file)
+    po = extract_po_fields(po_file)
+    wo_items = extract_wo_items(wo_file)
+    po_qtys = extract_po_quantities(po_file)
+    po_details_list = extract_po_details(po_file)  # List of dicts with Quantity/Colour_Code/Size
+    addr_res = compare_addresses(wo, po)
+    code_res = compare_codes(wo["product_codes"], po["product_codes"])
+
+    if matching_method == "Enhanced Matching (with PO Color/Size)":
+        matched, mismatched = enhanced_quantity_matching(wo_items, po_details_list, tolerance)
+    elif matching_method == "Smart Matching (Exact)":
+        matched, mismatched = smart_quantity_matching(wo_items, po_qtys)
+    elif matching_method == "Smart Matching with Tolerance":
+        matched, mismatched = smart_quantity_matching_with_tolerance(wo_items, po_qtys, tolerance)
+    else:
+        matched, mismatched = compare_quantity_by_order(wo_items, po_qtys)
+
+    st.header("Comparison Results")
+    st.subheader("Address Comparison")
+    st.dataframe(pd.DataFrame([addr_res]))
+
+    st.subheader("Product Code Comparison")
+    st.dataframe(pd.DataFrame(code_res))
+
+    st.subheader("WO Items")
+    st.dataframe(pd.DataFrame(wo_items))
+
+    st.subheader("Matched Quantities")
+    st.dataframe(pd.DataFrame(matched))
+
+    st.subheader("Mismatched Quantities")
+    st.dataframe(pd.DataFrame(mismatched))
+
+    if st.button("Download Results as Excel"):
+        excel_buf = make_excel(addr_res, code_res, wo_items, matched, mismatched, po_details=po_details_list)
+        st.download_button("Download Excel", data=excel_buf, file_name="WO_vs_PO_Comparison.xlsx")
+

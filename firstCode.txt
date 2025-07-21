@@ -1,0 +1,110 @@
+import streamlit as st
+import pdfplumber
+import re
+from fuzzywuzzy import fuzz
+import pandas as pd
+from io import BytesIO
+
+def truncate_after_sri_lanka(addr: str) -> str:
+    part, sep, _ = addr.partition("Sri Lanka")
+    return (part + sep).strip() if sep else addr.strip()
+
+def extract_wo_fields(pdf_file):
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    customer = delivery = ""
+    lines = text.split("\n")
+    for i, ln in enumerate(lines):
+        if "Deliver To:" in ln:
+            customer = lines[i-1].strip() if i > 0 else ""
+            delivery = re.sub(r"Deliver To:\s*", "", ln).strip()
+            break
+    codes = re.findall(r"Product Code[:\s]*([A-Z]+\s*\d+(?:\s*/\s*[A-Z]+\s*\d+)*)", text)
+    # split codes by "/" and clean whitespace
+    all_codes = []
+    for item in codes:
+        parts = [c.strip() for c in item.split("/")]
+        all_codes += parts
+    return {"customer_name": customer, "delivery_address": delivery, "product_codes": list(set(all_codes))}
+
+def extract_po_fields(pdf_file):
+    text = "\n".join(page.extract_text() or "" for page in pdfplumber.open(pdf_file).pages)
+    lines = [ln.strip() for ln in text.split("\n")]
+    capture = False
+    address_lines = []
+    for ln in lines:
+        if "Delivery Location:" in ln:
+            capture = True
+            continue
+        if capture:
+            if "Forwarder:" in ln:
+                break
+            if ln:
+                address_lines.append(ln)
+    raw_addr = " ".join(address_lines)
+    matches = re.findall(r".*Sri Lanka.*", text, re.IGNORECASE)
+    unique = [raw_addr] + [m for m in matches if m != raw_addr]
+    seen = []
+    for a in unique:
+        if a and a not in seen:
+            seen.append(a)
+    sri = [a for a in seen if "sri lanka" in a.lower()]
+    chosen = max(sri, key=len) if sri else seen[0] if seen else raw_addr
+    final_addr = truncate_after_sri_lanka(chosen)
+    po_codes = re.findall(r"(LB\s*\d+)", text)
+    return {"delivery_location": final_addr, "product_codes": po_codes, "all_found_addresses": seen}
+
+def compare_addresses(wo, po):
+    ns = fuzz.token_sort_ratio(wo["customer_name"], po["delivery_location"])
+    as_ = fuzz.token_sort_ratio(wo["delivery_address"], po["delivery_location"])
+    comb = max(ns, as_)
+    return {"WO Name": wo["customer_name"], "WO Addr": wo["delivery_address"], "PO Addr": po["delivery_location"],
+            "Name %": ns, "Addr %": as_, "Overall %": comb, "Status": "✅ Match" if comb > 85 else "⚠️ Review"}
+
+def compare_codes(wo_codes, po_codes):
+    results = []
+    for wc in wo_codes:
+        found_match = False
+        for pc in po_codes:
+            pts = fuzz.ratio(wc, pc)
+            results.append({"WO Code": wc, "PO Code": pc, "Match %": pts,
+                            "Status": "✅ Match" if pts == 100 else "⚠️ Partial" if pts > 80 else "❌ No"})
+            if pts == 100:
+                found_match = True
+        if not found_match:
+            results.append({"WO Code": wc, "PO Code": "", "Match %": "", "Status": "❌ WO code not found in PO"})
+    return results
+
+def make_excel(addr_res, code_res):
+    df_addr = pd.DataFrame([addr_res])
+    df_codes = pd.DataFrame(code_res)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        df_addr.to_excel(writer, sheet_name="Address Comparison", index=False)
+        df_codes.to_excel(writer, sheet_name="Code Comparison", index=False)
+    buf.seek(0)
+    return buf
+
+st.set_page_config(page_title="WO ↔ PO Compare", layout="centered")
+st.title("📄 WO vs PO Comparator")
+
+wo_file = st.file_uploader("Upload WO PDF", type="pdf")
+po_file = st.file_uploader("Upload PO PDF", type="pdf")
+
+if wo_file and po_file:
+    st.success("Processing...")
+    wo = extract_wo_fields(wo_file)
+    po = extract_po_fields(po_file)
+    with st.expander("🔍 Debug info"):
+        st.json(wo)
+        st.json(po)
+
+    addr_res = compare_addresses(wo, po)
+    code_res = compare_codes(wo["product_codes"], po["product_codes"])
+
+    st.subheader("🏷 Address Comparison")
+    st.dataframe(pd.DataFrame([addr_res]))
+    st.subheader("🆚 Product Code Matching")
+    st.dataframe(pd.DataFrame(code_res))
+
+    excel_buf = make_excel(addr_res, code_res)
+    st.download_button("📥 Download Results", data=excel_buf, file_name="comparison.xlsx")
